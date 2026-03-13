@@ -437,3 +437,12 @@ Testing changes locally in Cursor:
 npm login
 npm publish --access public
 ```
+
+
+   "notion-local": {
+      "command": "node",
+      "args": ["/home/nizar/HomeWspce/notion-mcp-server/bin/cli.mjs"],
+      "env": {
+        "NOTION_TOKEN": "ntn_xxxxxxxxxxx"
+      }
+    }    
