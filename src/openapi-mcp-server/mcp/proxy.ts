@@ -5,6 +5,9 @@ import { OpenAPIToMCPConverter } from '../openapi/parser'
 import { HttpClient, HttpClientError } from '../client/http-client'
 import { OpenAPIV3 } from 'openapi-types'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import axios from 'axios'
+import fs from 'fs'
+import path from 'path'
 
 type PathItemObject = OpenAPIV3.PathItemObject & {
   get?: OpenAPIV3.OperationObject
@@ -83,12 +86,38 @@ function deserializeParams(params: Record<string, unknown>): Record<string, unkn
   return result
 }
 
+const UPLOAD_IMAGE_TOOL_NAME = 'upload_image'
+
+const UPLOAD_IMAGE_TOOL: Tool = {
+  name: UPLOAD_IMAGE_TOOL_NAME,
+  description: 'Notion | Upload a local image to a Notion page. Reads the file from disk, uploads it to a GitHub repo (via GITHUB_TOKEN and GITHUB_REPO env vars), then appends an external image block to the page using the raw GitHub URL. Requires env vars: GITHUB_TOKEN (personal access token with repo scope), GITHUB_REPO (owner/repo format).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      file_path: {
+        type: 'string',
+        description: 'Absolute path to the local image file (e.g. /home/user/image.png)',
+      },
+      block_id: {
+        type: 'string',
+        description: 'The ID of the parent block (page) to append the image block to',
+      },
+    },
+    required: ['file_path', 'block_id'],
+  },
+  annotations: {
+    title: 'Upload Image',
+    destructiveHint: true,
+  },
+}
+
 // import this class, extend and return server
 export class MCPProxy {
   private server: Server
   private httpClient: HttpClient
   private tools: Record<string, NewToolDefinition>
   private openApiLookup: Record<string, OpenAPIV3.OperationObject & { method: string; path: string }>
+  private baseUrl: string
 
   constructor(name: string, openApiSpec: OpenAPIV3.Document) {
     this.server = new Server({ name, version: '1.0.0' }, { capabilities: { tools: {} } })
@@ -96,6 +125,7 @@ export class MCPProxy {
     if (!baseUrl) {
       throw new Error('No base URL found in OpenAPI spec')
     }
+    this.baseUrl = baseUrl
     this.httpClient = new HttpClient(
       {
         baseUrl,
@@ -143,12 +173,20 @@ export class MCPProxy {
         })
       })
 
+      // Add custom tools
+      tools.push(UPLOAD_IMAGE_TOOL)
+
       return { tools }
     })
 
     // Handle tool calling
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: params } = request.params
+
+      // Handle custom upload_image tool
+      if (name === UPLOAD_IMAGE_TOOL_NAME) {
+        return this.handleUploadImage(params as Record<string, unknown>)
+      }
 
       // Find the operation in OpenAPI spec
       const operation = this.findOperation(name)
@@ -193,6 +231,77 @@ export class MCPProxy {
         throw error
       }
     })
+  }
+
+  private async handleUploadImage(params: Record<string, unknown>) {
+    const filePath = params.file_path as string
+    const blockId = params.block_id as string
+
+    if (!filePath || !blockId) {
+      throw new Error('file_path and block_id are required')
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`)
+    }
+
+    const githubToken = process.env.GITHUB_TOKEN
+    const githubRepo = process.env.GITHUB_REPO
+    if (!githubToken || !githubRepo) {
+      throw new Error('GITHUB_TOKEN and GITHUB_REPO env vars are required')
+    }
+
+    // Step 1: Upload image to GitHub repo
+    const fileName = path.basename(filePath)
+    const destPath = `images/${Date.now()}-${fileName}`
+    const content = fs.readFileSync(filePath).toString('base64')
+
+    const ghRes = await axios.put(
+      `https://api.github.com/repos/${githubRepo}/contents/${destPath}`,
+      { message: `add ${fileName}`, content },
+      {
+        headers: {
+          Authorization: `token ${githubToken}`,
+          Accept: 'application/vnd.github.v3+json',
+        },
+      },
+    )
+
+    const rawUrl = ghRes.data?.content?.download_url
+    if (!rawUrl) {
+      throw new Error('GitHub upload failed: no download_url returned')
+    }
+
+    // Step 2: Append external image block to Notion page
+    const notionHeaders = this.parseHeadersFromEnv()
+    const appendRes = await axios.patch(
+      `${this.baseUrl}/v1/blocks/${blockId}/children`,
+      {
+        children: [
+          {
+            type: 'image',
+            image: {
+              type: 'external',
+              external: { url: rawUrl },
+            },
+          },
+        ],
+      },
+      {
+        headers: {
+          ...notionHeaders,
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({ image_url: rawUrl, notion: appendRes.data }),
+        },
+      ],
+    }
   }
 
   private findOperation(operationId: string): (OpenAPIV3.OperationObject & { method: string; path: string }) | null {
